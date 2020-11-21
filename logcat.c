@@ -19,8 +19,19 @@ void logcat_init(void);    /* constructor function */
 void logcat_fini(void);    /* destructor function (optional) */
 
 void cmd_logcat(void);     /* Declare the commands and their help data. */
-char *help_logcat[];
 
+#define PRINT_DEBUGLOG(level, ...) \
+	if (CRASHDEBUG(level))  \
+		fprintf(fp, __VA_ARGS__);  \
+
+char *log_prio = "UDVDIWEFS";
+#define USER_ADDR_MASK (logcat.user_addr_mask)  //android-r userspace address top 8bit tagged for dynamically detect TBI-compatible devices,prepare for ARM MTE
+#define LOGBUF_ENTRY_OFFSET (logcat.logbuf_entry_offset)
+#define LIST_LAST_ENTRY 0
+#define LIST_NEXT_ENTRY 0x8
+#define LIST_ELENMENT 0x10
+
+char *help_logcat[];
 struct log_time {
         uint32_t tv_sec;
         uint32_t tv_nsec;
@@ -45,6 +56,8 @@ struct logcat_struct {
         ulong start_brk;
         ulong brk;
         ulong mmap_base;
+	ulong user_addr_mask; //android-r userspace address top 8bit tagged for dynamically detect TBI-compatible devices
+	ulong logbuf_entry_offset;
 };
 struct logcat_struct logcat;
 #define LOGD_TASK "logd"
@@ -86,15 +99,11 @@ logcat_init(void) /* Register the command set. */
         if (!readmem(mm_struct + MEMBER_OFFSET("mm_struct", "brk"), KVADDR, &logcat.brk, sizeof(ulong), "brk", RETURN_ON_ERROR))
                 error(FATAL, "Read mm_struct brk failed\n");
 
+        logcat.user_addr_mask = (~((ulong)0xff<<56));
+        logcat.logbuf_entry_offset = 0;
         register_extension(command_table);
 }
 
-char *log_prio = "UDVDIWEFS";
-
-#define LOGBUF_ENTRY_OFFSET 0x8
-#define LIST_LAST_ENTRY 0
-#define LIST_NEXT_ENTRY 0x8
-#define LIST_ELENMENT 0x10
 int parse_log_entry(ulong log_entry)
 {
         ulong log_elenment;
@@ -104,19 +113,20 @@ int parse_log_entry(ulong log_entry)
         ulonglong nanos; 
 	ulong rem;
         if(readmem(log_entry + LIST_ELENMENT, UVADDR, &log_elenment, sizeof(ulong), "log_elenment", QUIET)) {
+		log_elenment &= USER_ADDR_MASK;
                 if(readmem(log_elenment, UVADDR, &Log, sizeof(struct LogBufferElement), "LogBufferElement", QUIET)) {
-                        msg = malloc(Log.mMsgLen);
+                        msg = GETBUF(Log.mMsgLen);
                         nanos = (ulonglong)Log.mRealTime.tv_nsec / (ulonglong)1000000000;
                         rem = (ulonglong)Log.mRealTime.tv_nsec % (ulonglong)1000000000;
                         time_t t = Log.mRealTime.tv_sec + nanos;
-                        if(readmem((ulong)Log.mMsg, UVADDR, msg, Log.mMsgLen, "Log", QUIET)) {
+                        if(readmem((ulong)Log.mMsg & USER_ADDR_MASK, UVADDR, msg, Log.mMsgLen, "Log", QUIET)) {
                                 /*[UID,PID,TID,PRIO,TAG,log]*/
                                 tm = localtime(&t);
                                 fprintf(fp, "[%02d-%02d %02d:%02d:%02d.%ld] %d %d %d %c %s:      %s\n",
                                         tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec, rem, Log.mUid, Log.mPid, Log.mTid,
                                         *((char *)((ulong)log_prio + msg[0])), &msg[1], (char *)((ulong)msg + strlen(msg)+1));
                         }
-                        free(msg);
+                        FREEBUF(msg);
                 } else {
                         return READ_ERROR;
                 }
@@ -134,11 +144,19 @@ int try_logBuf(ulong logBuf)
 {
         ulong log_entry, last_entry, next_entry;
         log_entry = logBuf + LOGBUF_ENTRY_OFFSET;
+        PRINT_DEBUGLOG(INFO, "try_logBuf logBuf:0x%lx, log_entry:0x%lx\n", logBuf, log_entry);
         do {
                 if(readmem(log_entry + LIST_NEXT_ENTRY, UVADDR, &next_entry, sizeof(ulong), "next_entry", QUIET)) {
+			next_entry &= USER_ADDR_MASK;
+	                PRINT_DEBUGLOG(INFO, "next_entry:%lx\n", next_entry);
+
                         if(readmem(next_entry + LIST_LAST_ENTRY, UVADDR, &last_entry, sizeof(ulong), "last_entry", QUIET)) {
-                                if (last_entry != log_entry)
+				last_entry &= USER_ADDR_MASK;
+				PRINT_DEBUGLOG(INFO, "last_entry:%lx\n", last_entry);
+                                if (last_entry != log_entry) {
+					PRINT_DEBUGLOG(INFO, "last_entry:%lx,log_entry=%lx\n", last_entry, log_entry);
                                         return SEEK_ERROR;
+				}
                                 if(log_entry != (logBuf + LOGBUF_ENTRY_OFFSET)) {//skip list head
                                         parse_log_entry(log_entry);
                                 }
@@ -161,7 +179,20 @@ void
 cmd_logcat(void)
 {
         ulong logBuf, addr;
+	int c;
         set_context(logcat.logd_task, NO_PID);
+	while ((c = getopt(argcnt, args, "Q")) != EOF) {
+		switch (c) {
+			case 'Q':
+		                PRINT_DEBUGLOG(INFO, "android-Q logcat\n");
+				logcat.user_addr_mask = (~(ulong)0x0);
+				logcat.logbuf_entry_offset = 8;
+				break;
+			default:
+		                PRINT_DEBUGLOG(INFO, "android-R logcat\n");
+				break;
+		}
+	}
         /*
                 static LogBuffer* logBuf = nullptr;
                 traversal .bss region to locate logBuf address
@@ -169,13 +200,16 @@ cmd_logcat(void)
         for (addr = logcat.end_data; addr < logcat.start_brk; addr += sizeof(ulong))
         {
                 if (readmem(addr, UVADDR, &logBuf, sizeof(ulong), "logBuf", QUIET)) {
+			logBuf &= USER_ADDR_MASK;
                         if ((logBuf < logcat.brk) || logBuf > logcat.mmap_base)//logBuf value should belong mmap region,malloc by malloc_lib in libc.so
                                 continue;
                         else {
-                                if (!try_logBuf(logBuf)) {
+		                PRINT_DEBUGLOG(INFO, "cmd_logcat addr:%lx\n", addr);
+                                if (!(c = try_logBuf(logBuf))) {
                                         break;
                                 }
                                 else {
+					PRINT_DEBUGLOG(INFO, "try_logBuf ret=%d\n", c);
                                         continue;
                                 }
                         }
@@ -187,7 +221,9 @@ cmd_logcat(void)
 
 char *help_logcat[] = {
         "logcat",                        /* command name */
+        "parse android logcat from ramdump of a crash extension\n",
+        "parse android main logcat",
+        "command support Android-R default,use \"logcat -Q\" to support older version",
+        "Any question please contact zhaoqianli@xiaomi.com",
         NULL
 };
-
-
